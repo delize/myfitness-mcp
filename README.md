@@ -26,6 +26,7 @@ This is a fork of [AdamWalt/myfitnesspal-mcp-python](https://github.com/AdamWalt
 | `mfp_update_food_entry` | Write | Update an existing diary entry by `entry_id` |
 | `mfp_delete_food_entry` | Write | Delete an existing diary entry by `entry_id` |
 | `mfp_get_report` | Read | Nutrition report (e.g. Net Calories) over a date range |
+| `mfp_get_steps` | Read | Daily step counts synced from Apple Health / devices |
 
 ### Food collections (recent / frequent / my foods)
 
