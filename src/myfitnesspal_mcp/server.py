@@ -15,6 +15,7 @@ profile (MFP_FIREFOX_PROFILE_DIR) or a JSON cookies file (MFP_COOKIES_FILE) -
 see cookie_loader.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -2290,7 +2291,9 @@ async def mfp_get_steps(params: GetStepsInput) -> str:
             )
 
         client = get_mfp_client()
-        days = get_steps_range(client, start, end)
+        # One blocking HTTP request per day; run off the event loop so other
+        # MCP tools and cancellation can proceed while we fetch the range.
+        days = await asyncio.to_thread(get_steps_range, client, start, end)
 
         counts = [d["steps"] for d in days if d["steps"] is not None]
         data: Dict[str, Any] = {
