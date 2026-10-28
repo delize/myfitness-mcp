@@ -70,6 +70,7 @@ Session cookies expire eventually (~30 days); when tools start failing with auth
 | `MCP_OAUTH_PASSCODE` | - | Shared passcode for the OAuth login page (remote connectors). Omit for unauthenticated LAN-only use |
 | `MCP_RESOURCE_URL` | - | Exact public URL clients use (no path), e.g. `https://mfp.example.com`. Required together with the passcode |
 | `MCP_ACCESS_TOKEN_TTL` | `2592000` (30 days) | Access-token lifetime in **seconds**. When the token expires the connector re-authorizes, which means re-entering the passcode; a short value (the old 24h default) forces a daily re-login if the client doesn't silently refresh. Lower it (e.g. `86400`) for tighter tokens |
+| `MCP_AUTH_MODE` | *(unset)* | `none`, `passcode_oauth` or `oauth`. Unset keeps the legacy behaviour above. For `oauth` (stateless Okta/JWT validation behind a gateway) and its `MCP_OAUTH_*` variables see [Behind an MCP Gateway](#behind-an-mcp-gateway-external-oauth--okta-jwts-mcp_auth_modeoauth) |
 
 ## Docker
 
@@ -95,6 +96,70 @@ Same flow as garmin-mcp-service:
 3. Claude redirects you to the `/login` passcode page once; enter `MCP_OAUTH_PASSCODE`. After that the client holds and refreshes its own token.
 
 The passcode proves "the caller knows the passcode", not identity - keep network-level access control (IP allowlist, VPN) in front of any internet-facing deployment. Omitting `MCP_OAUTH_PASSCODE`/`MCP_RESOURCE_URL` runs the HTTP server unauthenticated (a warning is logged); only do that on a trusted network.
+
+## Behind an MCP Gateway: External OAuth / Okta JWTs (`MCP_AUTH_MODE=oauth`)
+
+The passcode OAuth server above keeps its issued tokens **in memory**, so every
+container restart invalidates every client's token. When the server sits behind
+an MCP gateway (e.g. LiteLLM) that obtains its own tokens from an identity
+provider, use `MCP_AUTH_MODE=oauth` instead: the server becomes a stateless
+OAuth 2.0 resource server that only *verifies* RS256 JWT access tokens issued
+by an external authorization server (Okta, or any issuer publishing a JWKS).
+Nothing is stored, so restarts are invisible to clients.
+
+```bash
+MCP_TRANSPORT=streamable-http
+MCP_AUTH_MODE=oauth
+MCP_OAUTH_ISSUER=https://your-org.okta.com/oauth2/default   # required
+MCP_OAUTH_AUDIENCE=api://default                            # default; comma list allowed
+MCP_OAUTH_REQUIRED_SCOPES=mfp.read                          # default; comma list, ALL required
+MCP_OAUTH_ALLOWED_CLIENT_IDS=0oaXXXXXXXXXXXXXXXX            # optional; token's `cid` must be listed
+# MCP_OAUTH_JWKS_URI=https://your-org.okta.com/oauth2/default/v1/keys   # default: ${issuer}/v1/keys
+# MCP_OAUTH_CLOCK_TOLERANCE_SEC=30                          # default 30
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MCP_AUTH_MODE` | *(unset)* | `none`, `passcode_oauth` or `oauth`. Unset keeps the legacy behaviour (passcode OAuth if `MCP_OAUTH_PASSCODE`+`MCP_RESOURCE_URL` are set, no auth if neither is). |
+| `MCP_OAUTH_ISSUER` | — (required) | Expected `iss`. Must be `https://` (plain `http://` only for localhost). Startup fails without it. |
+| `MCP_OAUTH_AUDIENCE` | `api://default` | Accepted `aud` value(s), comma-separated. |
+| `MCP_OAUTH_REQUIRED_SCOPES` | `mfp.read` | Scopes that must all be present in `scp` (or a space-delimited `scope`). |
+| `MCP_OAUTH_ALLOWED_CLIENT_IDS` | *(any)* | If set, the token's `cid` (or `client_id`) must be one of these. |
+| `MCP_OAUTH_JWKS_URI` | `${issuer}/v1/keys` | Where signing keys are fetched from (Okta's path by default). |
+| `MCP_OAUTH_CLOCK_TOLERANCE_SEC` | `30` | Leeway for `exp`/`iat`/`nbf`. |
+
+Behaviour in `oauth` mode:
+- Only `RS256` is accepted (`HS*`, `none` etc. are rejected before any key lookup).
+- Signing keys are cached for an hour; a token with an unknown `kid` triggers a refetch (key rotation), rate-limited to one refetch per 10s.
+- No `Authorization` header → `401` with `WWW-Authenticate: Bearer realm="mfp-mcp"`.
+- Malformed header, bad signature, wrong `iss`/`aud`, expired, unknown `kid`, or a `cid` not in the allow-list → `401` with `error="invalid_token"`.
+- Valid token missing a required scope → `403` with `error="insufficient_scope"`.
+- The JWKS cannot be fetched and no key is cached → `503`.
+- The built-in OAuth endpoints (`/authorize`, `/token`, `/register`, `/revoke`, `/login`, `/.well-known/*`) are not mounted (404), so there is a single auth path. `MCP_OAUTH_PASSCODE`/`MCP_RESOURCE_URL` are ignored.
+- Tokens are never logged.
+
+The token's `sub` is not used for authorization - the server still acts as the single MyFitnessPal account behind its cookie source - but any token from the configured issuer/audience/client with the required scope is accepted. Per-user tokens (e.g. Okta Cross App Access / ID-JAG, where `sub` is the user's email) and machine tokens (client credentials) both work.
+
+**Okta setup:** in your Okta custom authorization server, add a scope `mfp.read` and an access policy rule that lets the gateway's client obtain tokens with it (via Cross App Access for per-user tokens, or the *Client Credentials* grant for a machine token). Set `MCP_OAUTH_ISSUER` to that authorization server's issuer URL, `MCP_OAUTH_AUDIENCE` to its audience, and `MCP_OAUTH_ALLOWED_CLIENT_IDS` to the gateway's client id.
+
+**Migrating from passcode OAuth:**
+1. Set up the Okta scope/policy above and configure the gateway to send `Authorization: Bearer <okta access token>` to `/mcp`.
+2. On this container set `MCP_AUTH_MODE=oauth`, `MCP_OAUTH_ISSUER`, `MCP_OAUTH_AUDIENCE` and (recommended) `MCP_OAUTH_ALLOWED_CLIENT_IDS`; remove `MCP_OAUTH_PASSCODE`/`MCP_RESOURCE_URL`/`MCP_ACCESS_TOKEN_TTL` (they are ignored in this mode).
+3. Restart and check the logs: a missing or invalid `MCP_OAUTH_*` setting aborts startup instead of running without auth. Clients that used the passcode flow directly (Claude/ChatGPT connectors) must go through the gateway now.
+
+```bash
+docker run -d -p 8000:8000 \
+  -v ~/.mozilla/firefox/abcd1234.default-release:/profile:ro \
+  -e MCP_AUTH_MODE=oauth \
+  -e MCP_OAUTH_ISSUER=https://your-org.okta.com/oauth2/default \
+  -e MCP_OAUTH_AUDIENCE=api://default \
+  -e MCP_OAUTH_ALLOWED_CLIENT_IDS=0oaXXXXXXXXXXXXXXXX \
+  ghcr.io/delize/myfitnesspal-mcp-service:latest
+```
+
+Leaving `MCP_AUTH_MODE` unset keeps the old behaviour exactly. `MCP_AUTH_MODE=none` is an explicit opt-in to no auth; `MCP_AUTH_MODE=passcode_oauth` is the passcode server with both variables strictly required.
+
+## Local stdio use
 
 For local stdio use (Claude Desktop):
 
