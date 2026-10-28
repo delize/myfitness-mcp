@@ -34,6 +34,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 from . import cookie_loader
+from .jwt_auth import JWTAuthConfig, JWTAuthMiddleware, JWTVerifier
 from .oauth_provider import SinglePasscodeOAuthProvider
 
 # Configure logging to stderr (required for stdio transport)
@@ -121,7 +122,65 @@ def _build_oauth() -> tuple[SinglePasscodeOAuthProvider | None, AuthSettings | N
     return provider, auth_settings
 
 
-_oauth_provider, _auth_settings = _build_oauth()
+# MCP_AUTH_MODE selects how the HTTP transport authenticates callers:
+#   (unset)         legacy behaviour: passcode OAuth if MCP_OAUTH_PASSCODE and
+#                   MCP_RESOURCE_URL are both set, no auth if both are unset,
+#                   refuse to start if only one is set.
+#   none            explicitly no auth (LAN-only / trusted network).
+#   passcode_oauth  the built-in passcode OAuth server; both variables required.
+#   oauth           stateless resource server: validate RS256 JWT access tokens
+#                   from an external issuer (e.g. Okta); see jwt_auth.py.
+AUTH_MODES = ("none", "passcode_oauth", "oauth")
+
+
+def _resolve_auth_mode() -> str | None:
+    """Return the configured MCP_AUTH_MODE, or None when unset (legacy)."""
+    raw = (os.getenv("MCP_AUTH_MODE") or "").strip().lower()
+    if not raw:
+        return None
+    if raw not in AUTH_MODES:
+        raise RuntimeError(
+            f"MCP_AUTH_MODE={raw!r} is not one of {', '.join(AUTH_MODES)} "
+            "(or unset). Refusing to start."
+        )
+    return raw
+
+
+def _build_auth() -> tuple[
+    str | None, SinglePasscodeOAuthProvider | None, AuthSettings | None, JWTVerifier | None
+]:
+    """Resolve (mode, passcode provider, auth settings, JWT verifier) from env."""
+    mode = _resolve_auth_mode()
+    log = logging.getLogger(__name__)
+
+    if mode == "oauth":
+        # Validate even for stdio so a broken config is never silently ignored.
+        verifier = JWTVerifier(JWTAuthConfig.from_env(os.environ))
+        if os.getenv("MCP_OAUTH_PASSCODE"):
+            log.warning("MCP_AUTH_MODE=oauth: ignoring MCP_OAUTH_PASSCODE (passcode OAuth is disabled).")
+        return mode, None, None, verifier
+
+    if mode == "none":
+        if os.getenv("MCP_TRANSPORT", "stdio") == "streamable-http":
+            log.warning(
+                "MCP_AUTH_MODE=none - serving /mcp WITHOUT authentication. "
+                "Do not expose this deployment to the internet."
+            )
+        return mode, None, None, None
+
+    if mode == "passcode_oauth" and os.getenv("MCP_TRANSPORT", "stdio") == "streamable-http":
+        missing = [v for v in ("MCP_OAUTH_PASSCODE", "MCP_RESOURCE_URL") if not os.getenv(v)]
+        if missing:
+            raise RuntimeError(
+                f"MCP_AUTH_MODE=passcode_oauth requires {' and '.join(missing)}. "
+                "Refusing to start rather than serving the MCP endpoint without authentication."
+            )
+
+    provider, auth_settings = _build_oauth()
+    return mode, provider, auth_settings, None
+
+
+_auth_mode, _oauth_provider, _auth_settings, _jwt_verifier = _build_auth()
 
 # Initialize MCP server
 mcp = FastMCP(
@@ -2658,6 +2717,19 @@ async def mfp_get_report(params: GetReportInput) -> str:
 # ============================================================================
 
 
+def create_http_app():
+    """The streamable-http ASGI app, wrapped in JWT auth when MCP_AUTH_MODE=oauth.
+
+    In oauth mode FastMCP is built with no auth provider, so none of the
+    passcode OAuth endpoints (/authorize, /token, /register, /login,
+    /.well-known/*) exist - the bearer JWT is the single auth path.
+    """
+    app = mcp.streamable_http_app()
+    if _jwt_verifier is not None:
+        return JWTAuthMiddleware(app, _jwt_verifier, mcp_path=mcp.settings.streamable_http_path)
+    return app
+
+
 def main():
     """Run the MCP server.
 
@@ -2671,10 +2743,21 @@ def main():
     - MCP_ALLOWED_HOSTS: Comma-separated list of allowed Host headers for reverse proxy
       (e.g., "mfp.example.com,mfp.example.com:443")
       If not set, DNS rebinding protection is disabled for HTTP mode.
+    - MCP_AUTH_MODE: none | passcode_oauth | oauth (unset = legacy passcode
+      auto-detection). See README "Behind an MCP Gateway".
     """
     transport = os.getenv("MCP_TRANSPORT", "stdio")
 
-    if transport == "streamable-http":
+    if transport == "streamable-http" and _jwt_verifier is not None:
+        import uvicorn
+
+        uvicorn.run(
+            create_http_app(),
+            host=mcp.settings.host,
+            port=mcp.settings.port,
+            log_level=mcp.settings.log_level.lower(),
+        )
+    elif transport == "streamable-http":
         mcp.run(transport="streamable-http")
     else:
         mcp.run()
