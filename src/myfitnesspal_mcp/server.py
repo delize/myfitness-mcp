@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
@@ -45,6 +45,9 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stderr)],
 )
 logger = logging.getLogger("myfitnesspal_mcp")
+
+# MyFitnessPal stores water in millilitres; US cup used only for legacy input.
+ML_PER_CUP = 236.588
 
 
 # Configure transport security based on mode
@@ -837,11 +840,19 @@ class SetWaterInput(BaseModel):
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    cups: float = Field(
-        ...,
-        description="Number of cups of water (e.g., 2.5 for 2.5 cups). Note: MyFitnessPal uses cups as the unit.",
+    milliliters: Optional[float] = Field(
+        default=None,
+        description="Total water for the day in millilitres (e.g. 1300 for 1.3 L). "
+        "Preferred. Replaces the day's total, it does not add to it.",
         ge=0,
-        le=50,
+        le=15000,
+    )
+    cups: Optional[float] = Field(
+        default=None,
+        description="Total water for the day in US cups (1 cup = 236.588 ml). "
+        "Legacy alternative to milliliters. Replaces the day's total.",
+        ge=0,
+        le=60,
     )
     date: Optional[str] = Field(
         default=None,
@@ -849,10 +860,76 @@ class SetWaterInput(BaseModel):
         pattern=r"^\d{4}-\d{2}-\d{2}$",
     )
 
+    @model_validator(mode="after")
+    def _exactly_one_amount(self) -> "SetWaterInput":
+        if (self.milliliters is None) == (self.cups is None):
+            raise ValueError("Provide exactly one of 'milliliters' or 'cups'")
+        return self
+
 
 # ============================================================================
 # Diary Entry Creation Helper Functions
 # ============================================================================
+
+
+# MyFitnessPal's internal v2 JSON API (same one the web client uses). Ported
+# from upstream AdamWalt/myfitnesspal-mcp-python for the measurements and
+# steps readers.
+MFP_API_BASE = "https://api.myfitnesspal.com"
+MFP_CLIENT_ID = "mfp-main-js"
+
+
+def _mfp_api_headers(client, json_body: bool = False) -> Dict[str, str]:
+    """
+    Build auth headers for MyFitnessPal's v2 JSON API.
+
+    The v2 API requires the session's OAuth bearer token plus an
+    mfp-client-id identifying the calling client.
+    """
+    headers = {
+        "Authorization": f"Bearer {client.access_token}",
+        "mfp-client-id": MFP_CLIENT_ID,
+        "mfp-user-id": str(client.user_id),
+        "Accept": "application/json",
+    }
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+def get_food_v2(client, mfp_id: str) -> Dict[str, Any]:
+    """
+    Fetch a food's full v2 record, including its version and serving sizes.
+
+    The diary API rejects entries whose food version does not match the
+    current stored version, so this must be read fresh rather than cached.
+
+    Args:
+        client: Authenticated myfitnesspal.Client instance
+        mfp_id: MyFitnessPal food item ID
+
+    Returns:
+        The food object as returned by the v2 API
+
+    Raises:
+        RuntimeError: If the food cannot be retrieved
+    """
+    response = client.session.get(
+        f"{MFP_API_BASE}/v2/foods",
+        params={"ids": str(mfp_id)},
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Could not look up food {mfp_id}: HTTP {response.status_code}"
+        )
+
+    items = response.json().get("items") or []
+    if not items:
+        raise RuntimeError(f"No food found with ID {mfp_id}")
+    return items[0]
+
 
 
 def add_food_to_diary(
@@ -1031,7 +1108,7 @@ def add_food_to_diary(
         raise RuntimeError(f"Failed to add food to diary: {e}")
 
 
-def set_water_intake(client, target_date: date, cups: float) -> None:
+def set_water_intake(client, target_date: date, milliliters: float) -> None:
     """
     Set water intake for a specific date.
 
@@ -1050,7 +1127,7 @@ def set_water_intake(client, target_date: date, cups: float) -> None:
     Args:
         client: Authenticated myfitnesspal.Client instance
         target_date: Date to set water intake
-        cups: Number of cups of water
+        milliliters: Total water for the day in ml (replaces, does not add)
 
     Raises:
         RuntimeError: If the operation fails
@@ -1081,7 +1158,7 @@ def set_water_intake(client, target_date: date, cups: float) -> None:
             "X-Requested-With": "XMLHttpRequest",
             "Referer": diary_url,
         }
-        milliliters = round(cups * 236.588, 2)
+        milliliters = round(milliliters, 2)
 
         response = client.session.post(
             water_url,
@@ -1091,8 +1168,12 @@ def set_water_intake(client, target_date: date, cups: float) -> None:
         )
         response.raise_for_status()
 
-        logger.info(f"Successfully set water intake to {cups} cups for {target_date}")
+        logger.info(f"Successfully set water intake to {milliliters} ml for {target_date}")
 
+    except RuntimeError as e:
+        # Messages raised above are ours and safe to surface. Masking them
+        # previously turned an endpoint change into a misleading auth error.
+        raise RuntimeError(f"Failed to set water intake: {e}") from e
     except Exception as e:
         # Don't expose internal error details to avoid leaking sensitive information
         error_msg = str(e)
@@ -1100,7 +1181,10 @@ def set_water_intake(client, target_date: date, cups: float) -> None:
         if "HTTP" in error_msg or "status" in error_msg.lower():
             raise RuntimeError(f"Failed to set water intake: {error_msg}")
         else:
-            raise RuntimeError("Failed to set water intake. Please check your authentication and try again.")
+            raise RuntimeError(
+                f"Failed to set water intake ({type(e).__name__}). "
+                "Check authentication and the MFP water endpoint."
+            )
 
 
 # ============================================================================
@@ -2172,7 +2256,9 @@ async def mfp_get_water(params: GetWaterInput) -> str:
     """
     Get water intake for a specific date.
 
-    Returns the number of cups/glasses of water logged for the day.
+    MyFitnessPal's `/food/water` endpoint returns the amount in a field named
+    `milliliters` (python-myfitnesspal's `_get_water`), so `day.water` is
+    always ml regardless of the account's display unit.
 
     Args:
         params: GetWaterInput containing:
@@ -2188,8 +2274,7 @@ async def mfp_get_water(params: GetWaterInput) -> str:
 
         data = {
             "date": str(target_date),
-            "water_cups": day.water,
-            "water_ml": day.water * 236.588,  # Convert cups to ml
+            "water_ml": day.water,
         }
 
         return json.dumps(data, indent=2)
@@ -2781,12 +2866,14 @@ async def mfp_set_water(params: SetWaterInput) -> str:
     """
     Log water intake for a specific date.
 
-    Sets the number of cups of water consumed for the day. MyFitnessPal uses
-    cups as the unit (1 cup = ~237ml).
+    Sets the day's total water. MyFitnessPal stores water in millilitres, so
+    pass `milliliters` (preferred) or `cups` (converted at 236.588 ml/cup).
+    The value replaces the day's total rather than adding to it.
 
     Args:
         params: SetWaterInput containing:
-            - cups (float): Number of cups of water (e.g., 2.5 for 2.5 cups)
+            - milliliters (float, optional): Total ml for the day
+            - cups (float, optional): Total US cups for the day
             - date (str, optional): Date in YYYY-MM-DD format, defaults to today
 
     Returns:
@@ -2796,16 +2883,19 @@ async def mfp_set_water(params: SetWaterInput) -> str:
         client = get_mfp_client()
         target_date = parse_date(params.date)
 
-        # Set water intake
-        set_water_intake(client=client, target_date=target_date, cups=params.cups)
+        if params.milliliters is not None:
+            ml = float(params.milliliters)
+        else:
+            ml = float(params.cups) * ML_PER_CUP
+
+        set_water_intake(client=client, target_date=target_date, milliliters=ml)
 
         return json.dumps(
             {
                 "success": True,
-                "message": f"Successfully logged {params.cups} cups of water",
+                "message": f"Set water for {target_date} to {round(ml)} ml",
                 "date": str(target_date),
-                "cups": params.cups,
-                "milliliters": round(params.cups * 236.588, 2),
+                "water_ml": round(ml, 2),
             },
             indent=2,
         )
