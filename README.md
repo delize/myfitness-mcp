@@ -19,13 +19,14 @@ This is a fork of [AdamWalt/myfitnesspal-mcp-python](https://github.com/AdamWalt
 | `mfp_get_exercises` | Read | Logged cardio/strength exercises for a date |
 | `mfp_get_goals` | Read | Daily nutrition goals |
 | `mfp_set_goals` | Write | Update daily nutrition goals |
-| `mfp_get_water` | Read | Water intake for a date |
-| `mfp_set_water` | Write | Log water intake for a date |
+| `mfp_get_water` | Read | Water intake for a date, in ml |
+| `mfp_set_water` | Write | Set the day's water total (`milliliters`, or legacy `cups`) |
 | `mfp_add_food_to_diary` | Write | Add a food entry to a meal |
 | `mfp_create_food` | Write | Create a new custom food in the MyFitnessPal database |
 | `mfp_update_food_entry` | Write | Update an existing diary entry by `entry_id` |
 | `mfp_delete_food_entry` | Write | Delete an existing diary entry by `entry_id` |
 | `mfp_get_report` | Read | Nutrition report (e.g. Net Calories) over a date range |
+| `mfp_get_steps` | Read | Daily step counts synced from Apple Health / devices |
 
 ### Food collections (recent / frequent / my foods)
 
