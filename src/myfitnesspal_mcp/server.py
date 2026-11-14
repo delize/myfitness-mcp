@@ -572,6 +572,22 @@ class GetExercisesInput(BaseModel):
     )
 
 
+class GetStepsInput(BaseModel):
+    """Input model for getting a day's step count."""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    date: Optional[str] = Field(
+        default=None,
+        description="Date in YYYY-MM-DD format. Defaults to today if not specified.",
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+    response_format: ResponseFormat = Field(
+        default=ResponseFormat.MARKDOWN,
+        description="Output format: 'markdown' for human-readable or 'json' for structured data",
+    )
+
+
 class GetGoalsInput(BaseModel):
     """Input model for getting nutrition goals."""
 
@@ -1124,6 +1140,39 @@ def get_food_entries_v2(client, target_date: date) -> List[Dict[str, Any]]:
     if response.status_code != 200:
         raise RuntimeError(f"Could not read food entries: HTTP {response.status_code}")
     return [item for item in response.json().get("items", []) if item.get("type") == "food_entry"]
+
+
+def get_steps_v2(client, target_date: date) -> Dict[str, Any]:
+    """
+    A day's step count, as MyFitnessPal received it from the phone or a tracker.
+
+    The diary page only shows the calorie credit for steps ("MFP iOS calorie
+    adjustment"); the count itself is a steps_aggregate item in the v2 diary.
+    When several sources report, the one MFP marks primary wins.
+    """
+    day = target_date.strftime("%Y-%m-%d")
+    response = client.session.get(
+        f"{MFP_API_BASE}/v2/diary",
+        params={"entry_date": day, "types": "steps_aggregate"},
+        headers=_mfp_api_headers(client),
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Could not read steps: HTTP {response.status_code}")
+    items = [
+        item
+        for item in response.json().get("items", [])
+        if item.get("type") == "steps_aggregate" and item.get("steps") is not None
+    ]
+    if not items:
+        return {"date": day, "steps": None, "calories": None}
+    best = max(items, key=lambda item: (bool(item.get("primary")), item.get("steps") or 0))
+    energy = best.get("energy") or {}
+    return {
+        "date": day,
+        "steps": int(best["steps"]),
+        "calories": energy.get("value"),
+    }
 
 
 def find_food_entry_uuid(
@@ -2573,6 +2622,38 @@ async def mfp_get_exercises(params: GetExercisesInput) -> str:
 
     except Exception as e:
         return f"Error getting exercises: {str(e)}"
+
+
+@mcp.tool(
+    name="mfp_get_steps",
+    annotations={
+        "title": "Get Step Count",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def mfp_get_steps(params: GetStepsInput) -> str:
+    """
+    Get a day's step count, synced to MyFitnessPal from the phone or a tracker.
+
+    Args:
+        params: GetStepsInput containing:
+            - date (str, optional): Date in YYYY-MM-DD format, defaults to today
+            - response_format (str): 'markdown' or 'json'
+
+    Returns:
+        str: {"date", "steps", "calories"}; steps and calories are null when
+        nothing synced that day. calories is the credit MFP added for the steps.
+    """
+    try:
+        client = get_mfp_client()
+        target_date = parse_date(params.date)
+        data = get_steps_v2(client, target_date)
+        return format_response(data, params.response_format, f"Steps for {target_date}")
+    except Exception as e:
+        return f"Error getting steps: {str(e)}"
 
 
 @mcp.tool(
